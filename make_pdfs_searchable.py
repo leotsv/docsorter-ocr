@@ -254,8 +254,14 @@ def get_page_count(pdf_path):
         return 1
 
 
-def make_searchable(pdf_path, dpi=200):
-    """Add searchable text layer to an image-only PDF."""
+def make_searchable(pdf_path, dpi=200, poppler_path=None):
+    """Add searchable text layer to an image-only PDF. Returns the path of
+    a persistent temp file holding the searchable copy (caller removes it).
+
+    `poppler_path` overrides this module's POPPLER_PATH, so a caller that
+    owns its own tool setup (DocumentSorter's sort_scans) reuses this ONE
+    OCR pipeline instead of a copy of it."""
+    poppler = poppler_path or POPPLER_PATH
     lp = long_path(pdf_path)
     npages = get_page_count(pdf_path)
 
@@ -272,8 +278,8 @@ def make_searchable(pdf_path, dpi=200):
                     dpi=dpi,
                     thread_count=1,
                 )
-                if POPPLER_PATH:
-                    kwargs["poppler_path"] = POPPLER_PATH
+                if poppler:
+                    kwargs["poppler_path"] = poppler
                 images = convert_from_path(lp, **kwargs)
                 if not images:
                     raise RuntimeError(f"No image for page {pg}")
@@ -284,7 +290,7 @@ def make_searchable(pdf_path, dpi=200):
                 del images  # Free memory
 
             except Exception as e:
-                raise RuntimeError(f"pdf2image failed on page {pg} (poppler_path={POPPLER_PATH}): {e}")
+                raise RuntimeError(f"pdf2image failed on page {pg} (poppler_path={poppler}): {e}")
 
             # Run tesseract to create PDF with text layer
             ocr_base = os.path.join(tmpdir, f"ocr_{pg:04d}")
@@ -337,6 +343,30 @@ def make_searchable(pdf_path, dpi=200):
         return persistent.name
 
 
+def _load_into_writer(lp):
+    """-> PdfWriter holding every page of `lp`, read fully into memory
+    first so the file handle is closed before the original is replaced."""
+    with open(lp, "rb") as f:
+        pdf_bytes = io.BytesIO(f.read())
+    reader = PdfReader(pdf_bytes)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    return writer
+
+
+def _replace_with(writer, lp, orig_stat, prefix):
+    """Write `writer` to a temp file, copy it over `lp`, and restore the
+    original access/modify times from `orig_stat`."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix=prefix)
+    tmp.close()
+    with open(tmp.name, "wb") as f:
+        writer.write(f)
+    shutil.copy2(tmp.name, lp)
+    os.utime(lp, (orig_stat.st_atime, orig_stat.st_mtime))
+    os.remove(tmp.name)
+
+
 def inject_text_into_pdf(pdf_path, text):
     """Add invisible text to the first page of a PDF for classification purposes.
 
@@ -346,37 +376,15 @@ def inject_text_into_pdf(pdf_path, text):
     Timestamps are preserved.
     """
     lp = long_path(pdf_path)
-
-    # Preserve original timestamps
-    orig_stat = os.stat(lp)
-    orig_atime = orig_stat.st_atime
-    orig_mtime = orig_stat.st_mtime
-
-    # Read into memory so the file handle is closed before we overwrite
-    with open(lp, "rb") as f:
-        pdf_bytes = io.BytesIO(f.read())
-
-    reader = PdfReader(pdf_bytes)
-    writer = PdfWriter()
+    orig_stat = os.stat(lp)   # timestamps are preserved
 
     # Add all pages to writer first, then inject into the writer's copy.
     # This ensures the content stream ends up as a proper indirect object
     # in the writer's object pool (direct DecodedStreamObject on the reader's
     # page may not serialize correctly through add_page cloning).
-    for page in reader.pages:
-        writer.add_page(page)
-
+    writer = _load_into_writer(lp)
     _inject_text_into_writer_page(writer, 0, text)
-
-    # Write to temp file, then replace original
-    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="inject_")
-    tmp.close()
-    with open(tmp.name, "wb") as f:
-        writer.write(f)
-
-    shutil.copy2(tmp.name, lp)
-    os.utime(lp, (orig_atime, orig_mtime))
-    os.remove(tmp.name)
+    _replace_with(writer, lp, orig_stat, "inject_")
 
 
 def remove_injection_from_pdf(pdf_path):
@@ -384,12 +392,7 @@ def remove_injection_from_pdf(pdf_path):
     from pypdf.generic import NameObject, DecodedStreamObject
     lp = long_path(pdf_path)
     orig_stat = os.stat(lp)
-    with open(lp, "rb") as f:
-        pdf_bytes = io.BytesIO(f.read())
-    reader = PdfReader(pdf_bytes)
-    writer = PdfWriter()
-    for page in reader.pages:
-        writer.add_page(page)
+    writer = _load_into_writer(lp)
     page = writer.pages[0]
     existing = _get_page_stream_bytes(page)
     stripped = re.sub(rb"q 1 1 1 rg BT [^\n]*/F_inj[^\n]*Tj ET Q\n?", b"", existing)
@@ -398,13 +401,7 @@ def remove_injection_from_pdf(pdf_path):
         new_stream.set_data(stripped)
         new_ref = writer._add_object(new_stream)
         page[NameObject("/Contents")] = new_ref
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="inject_")
-        tmp.close()
-        with open(tmp.name, "wb") as f:
-            writer.write(f)
-        shutil.copy2(tmp.name, lp)
-        os.utime(lp, (orig_stat.st_atime, orig_stat.st_mtime))
-        os.remove(tmp.name)
+        _replace_with(writer, lp, orig_stat, "inject_")
 
 
 def _inject_text_into_writer_page(writer, page_index, text):
@@ -546,10 +543,7 @@ def remove_text_from_pdf(pdf_path, text_to_remove):
 
     lp = long_path(pdf_path)
 
-    # Preserve original timestamps
-    orig_stat = os.stat(lp)
-    orig_atime = orig_stat.st_atime
-    orig_mtime = orig_stat.st_mtime
+    orig_stat = os.stat(lp)   # timestamps are preserved
 
     reader = PdfReader(lp)
     writer = PdfWriter()
@@ -588,15 +582,7 @@ def remove_text_from_pdf(pdf_path, text_to_remove):
     if removed_count == 0:
         return 0
 
-    # Write to temp file, then replace original
-    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="rmtext_")
-    tmp.close()
-    with open(tmp.name, "wb") as f:
-        writer.write(f)
-
-    shutil.copy2(tmp.name, lp)
-    os.utime(lp, (orig_atime, orig_mtime))
-    os.remove(tmp.name)
+    _replace_with(writer, lp, orig_stat, "rmtext_")
     return removed_count
 
 
@@ -679,6 +665,38 @@ def save_state(directory, state):
         json.dump(state, f, indent=2)
 
 
+def _pdf_files_or_exit(sources):
+    """-> absolute paths of `sources`; exits 1 on a missing or non-PDF file."""
+    files = [os.path.abspath(s) for s in sources]
+    for f in files:
+        if not os.path.isfile(f):
+            print(f"ERROR: File not found: {f}")
+            sys.exit(1)
+        if not f.lower().endswith(".pdf"):
+            print(f"ERROR: Not a PDF: {f}")
+            sys.exit(1)
+    return files
+
+
+def _record_result(state, counts, counter, rel, result, sequential):
+    """Print one worker result and file it in `state` and `counts`.
+    The sequential loop also prints skips and the ERR time; the parallel
+    one stays quiet on skips."""
+    path, status, msg, elapsed = result
+    if status == "ok":
+        print(f"{counter} OK  {rel} ({msg}, {elapsed:.1f}s)")
+        state["completed"].append(path)
+    elif status == "skip":
+        if sequential:
+            print(f"{counter} SKIP {rel} ({msg})")
+        state["skipped"].append(path)
+    else:
+        tail = f" ({elapsed:.1f}s)" if sequential else ""
+        print(f"{counter} ERR {rel}: {msg}{tail}")
+        state["errors"].append({"file": path, "error": msg})
+    counts[status if status in ("ok", "skip") else "err"] += 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Add searchable text layers to scanned PDFs"
@@ -699,14 +717,7 @@ def main():
 
     # ── Remove-text mode ─────────────────────────────────────────────────
     if args.remove_text:
-        files = [os.path.abspath(s) for s in args.source]
-        for f in files:
-            if not os.path.isfile(f):
-                print(f"ERROR: File not found: {f}")
-                sys.exit(1)
-            if not f.lower().endswith(".pdf"):
-                print(f"ERROR: Not a PDF: {f}")
-                sys.exit(1)
+        files = _pdf_files_or_exit(args.source)
 
         print(f"Removing text: \"{args.remove_text}\"")
         print(f"Files: {len(files)}")
@@ -728,14 +739,7 @@ def main():
 
     # ── Inject-text mode ──────────────────────────────────────────────────
     if args.inject_text:
-        files = [os.path.abspath(s) for s in args.source]
-        for f in files:
-            if not os.path.isfile(f):
-                print(f"ERROR: File not found: {f}")
-                sys.exit(1)
-            if not f.lower().endswith(".pdf"):
-                print(f"ERROR: Not a PDF: {f}")
-                sys.exit(1)
+        files = _pdf_files_or_exit(args.source)
 
         print(f"Injecting text: \"{args.inject_text}\"")
         print(f"Files: {len(files)}")
@@ -809,9 +813,7 @@ def main():
     # Process files
     start_time = time.time()
     processed = 0
-    ok_count = 0
-    skip_count = 0
-    err_count = 0
+    counts = {"ok": 0, "skip": 0, "err": 0}
 
     # Get current tool paths for passing to workers
     tess_cmd = pytesseract.pytesseract.tesseract_cmd
@@ -836,21 +838,8 @@ def main():
             dir_name = os.path.relpath(d, directory)
 
             result = process_single_file((pdf_path, args.dpi, args.force, tess_cmd, pop_path))
-            path, status, msg, elapsed = result
-
             counter = f"[{dir_name} {dir_idx}/{dir_total} | {idx}/{len(all_pdfs)}]"
-            if status == "ok":
-                print(f"{counter} OK  {rel} ({msg}, {elapsed:.1f}s)")
-                state["completed"].append(path)
-                ok_count += 1
-            elif status == "skip":
-                print(f"{counter} SKIP {rel} ({msg})")
-                state["skipped"].append(path)
-                skip_count += 1
-            else:
-                print(f"{counter} ERR {rel}: {msg} ({elapsed:.1f}s)")
-                state["errors"].append({"file": path, "error": msg})
-                err_count += 1
+            _record_result(state, counts, counter, rel, result, sequential=True)
 
             processed += 1
             if processed % 25 == 0:
@@ -867,7 +856,8 @@ def main():
                 for p in remaining
             }
             for future in as_completed(futures):
-                path, status, msg, elapsed = future.result()
+                result = future.result()
+                path = result[0]
                 rel = os.path.relpath(path, directory)
                 idx = len(done_set) + processed + 1
                 d = os.path.dirname(path)
@@ -877,17 +867,7 @@ def main():
                 dir_name = os.path.relpath(d, directory)
 
                 counter = f"[{dir_name} {dir_idx}/{dir_total} | {idx}/{len(all_pdfs)}]"
-                if status == "ok":
-                    print(f"{counter} OK  {rel} ({msg}, {elapsed:.1f}s)")
-                    state["completed"].append(path)
-                    ok_count += 1
-                elif status == "skip":
-                    state["skipped"].append(path)
-                    skip_count += 1
-                else:
-                    print(f"{counter} ERR {rel}: {msg}")
-                    state["errors"].append({"file": path, "error": msg})
-                    err_count += 1
+                _record_result(state, counts, counter, rel, result, sequential=False)
 
                 processed += 1
                 if processed % 25 == 0:
@@ -898,11 +878,11 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"DONE in {total_elapsed/60:.1f} minutes")
-    print(f"  Converted: {ok_count}")
-    print(f"  Skipped (already searchable): {skip_count}")
-    print(f"  Errors: {err_count}")
+    print(f"  Converted: {counts['ok']}")
+    print(f"  Skipped (already searchable): {counts['skip']}")
+    print(f"  Errors: {counts['err']}")
     print(f"  Progress saved to: {os.path.join(directory, STATE_FILENAME)}")
-    if err_count > 0:
+    if counts["err"] > 0:
         print(f"\nFiles with errors:")
         for e in state["errors"][-10:]:
             print(f"  {os.path.relpath(e['file'], directory)}: {e['error']}")

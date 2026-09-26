@@ -290,3 +290,62 @@ def test_process_single_file_error_restores_backup(tmp_path, monkeypatch):
     # File restored to original (or left intact); backup removed
     assert not os.path.exists(mps.long_path(p) + ".bak")
     assert open(p, "rb").read() == original
+
+
+# ── extracted helpers (dup tollgate 2026-09-25) ───────────────────────────────
+
+@pytest.mark.parametrize("caller, expected", [
+    (r"C:\caller\poppler", r"C:\caller\poppler"),   # caller's path wins
+    (None, r"C:\global\poppler"),                    # else the module's
+])
+def test_make_searchable_poppler_path(tmp_path, monkeypatch, caller, expected):
+    """poppler_path= overrides the module global, so DocumentSorter's
+    sort_scans (which owns its own POPPLER_PATH) reuses this pipeline."""
+    p = _make_real_pdf(tmp_path / "scan.pdf")
+    seen = {}
+
+    def fake_convert(path, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop")
+    monkeypatch.setattr(mps, "convert_from_path", fake_convert)
+    monkeypatch.setattr(mps, "POPPLER_PATH", r"C:\global\poppler")
+    with pytest.raises(RuntimeError, match="pdf2image failed"):
+        mps.make_searchable(p, dpi=150, poppler_path=caller)
+    assert seen["poppler_path"] == expected
+    assert seen["dpi"] == 150
+
+
+def test_load_into_writer_and_replace_with_keep_pages_and_times(tmp_path):
+    p = _make_real_pdf(tmp_path / "one.pdf")
+    os.utime(p, (1_000_000_000, 1_000_000_000))
+    st = os.stat(p)
+    writer = mps._load_into_writer(p)
+    assert len(writer.pages) == 1
+    mps._replace_with(writer, p, st, "t_")
+    assert os.stat(p).st_mtime == pytest.approx(1_000_000_000)
+    assert mps.get_page_count(p) == 1
+
+
+def test_pdf_files_or_exit(tmp_path):
+    p = _make_real_pdf(tmp_path / "a.pdf")
+    assert mps._pdf_files_or_exit([p]) == [os.path.abspath(p)]
+    txt = tmp_path / "a.txt"
+    txt.write_text("x")
+    with pytest.raises(SystemExit):
+        mps._pdf_files_or_exit([str(txt)])
+    with pytest.raises(SystemExit):
+        mps._pdf_files_or_exit([str(tmp_path / "missing.pdf")])
+
+
+def test_record_result_files_each_status(capsys):
+    state = {"completed": [], "skipped": [], "errors": []}
+    counts = {"ok": 0, "skip": 0, "err": 0}
+    mps._record_result(state, counts, "[c]", "a.pdf", ("A", "ok", "done", 1.0), True)
+    mps._record_result(state, counts, "[c]", "b.pdf", ("B", "skip", "has text", 0.1), False)
+    mps._record_result(state, counts, "[c]", "c.pdf", ("C", "error", "boom", 2.0), True)
+    out = capsys.readouterr().out
+    assert counts == {"ok": 1, "skip": 1, "err": 1}
+    assert state["completed"] == ["A"] and state["skipped"] == ["B"]
+    assert state["errors"] == [{"file": "C", "error": "boom"}]
+    assert "SKIP" not in out            # parallel mode is quiet on skips
+    assert "ERR c.pdf: boom (2.0s)" in out

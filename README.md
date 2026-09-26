@@ -33,6 +33,14 @@ still reads the same.
 |---|---|
 | `make_pdfs_searchable.py` | recursive OCR pass over a folder of PDFs (`make_searchable`, `process_single_file`, resumable through `.ocr_progress.json`), plus the invisible-text-layer editors `inject_text_into_pdf` / `remove_injection_from_pdf` / `remove_text_from_pdf`, and the tesseract/poppler discovery used by both (`setup_tools`, `find_tesseract`, `find_poppler`) |
 
+It is the program's ONE copy of the PDF/OCR toolchain (house duplication
+tollgate, 2026-09-25): DocumentSorter's `sort_scans` imports
+`pdfplumber`/`PdfReader`/`convert_from_path`/`pytesseract`,
+`get_page_count` and `long_path` from here, and its OCR embed calls
+`make_searchable(path, dpi, poppler_path=...)` — the `poppler_path`
+argument lets a caller that owns its own tool setup pass its poppler
+directory instead of relying on this module's `POPPLER_PATH`.
+
 It is also a CLI in its own right:
 
 ```bash
